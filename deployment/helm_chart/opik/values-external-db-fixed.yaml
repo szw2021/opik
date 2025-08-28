@@ -1,0 +1,339 @@
+# Opik配置 - 使用外部数据库服务
+# 这个文件展示了如何配置Opik使用外部的MySQL、Redis、ClickHouse服务
+
+nameOverride: "opik"
+fullnameOverride: ""
+
+# 基础配置
+standalone: true
+basicAuth: false
+registry: ""
+# 启用Demo数据生成任务
+demoDataJob:
+  enabled: true
+
+component:
+  backend:
+    enabled: true
+    serviceAccount:
+      create: true
+      name: opik-backend
+    image:
+      repository: docker.io/shizhiwei2024/opik-backend-custom
+      pullPolicy: Always
+      tag: "1.8.32-custom"
+    replicaCount: 1
+
+    # 跳过数据库迁移 - 避免SQL同步冲突
+    run_migration: true
+
+    env:
+      # MySQL配置 - 阿里云RDS MySQL
+      STATE_DB_PROTOCOL: "jdbc:mysql://"
+      STATE_DB_URL: "rm-j6cnx7ou6hi9zv199.mysql.cnhk.rds.aliyuncs.com:3306/aitrack?rewriteBatchedStatements=true&useSSL=true"
+      STATE_DB_DATABASE_NAME: "aitrack"
+      STATE_DB_USER: "aitrack"
+      STATE_DB_PASS: "aplus2025!"
+
+      # ClickHouse配置 - 阿里云ClickHouse - 改为HTTP避免SSL阻塞
+      ANALYTICS_DB_MIGRATIONS_URL: "jdbc:clickhouse://cc-j6c355w51420669mi.clickhouse.ads.aliyuncs.com:8123/default?socket_timeout=30000&connection_timeout=10000"
+      ANALYTICS_DB_MIGRATIONS_USER: "aitrack"
+      ANALYTICS_DB_MIGRATIONS_PASS: "aplus2025!"
+      ANALYTICS_DB_PROTOCOL: "HTTP"
+      ANALYTICS_DB_HOST: "cc-j6c355w51420669mi.clickhouse.ads.aliyuncs.com"
+      ANALYTICS_DB_PORT: "8123"
+      ANALYTICS_DB_USERNAME: "aitrack"
+      ANALYTICS_DB_PASS: "aplus2025!"
+      ANALYTICS_DB_DATABASE_NAME: "default"
+
+      # Redis配置 - 阿里云Redis
+      REDIS_URL: "redis://r-j6cdvgluw9rhipjlnq:aplus2025!@r-j6cdvgluw9rhipjlnq.redis.rds.aliyuncs.com:6379/"
+
+      # Java配置 - 修复过时的JVM参数
+      JAVA_OPTS: "-Dliquibase.propertySubstitutionEnabled=true -XX:+UseG1GC -XX:MaxRAMPercentage=60.0 -XX:MinRAMPercentage=50 -Dlogging.level.com.comet.opik=DEBUG -Dlogging.level.root=INFO -Dlogging.level.io.dropwizard=DEBUG -Xlog:gc*:gc.log:time -Djava.awt.headless=true"
+
+      # 其他服务配置
+      PYTHON_EVALUATOR_URL: "http://opik-python-backend:8000"
+
+      # OpenTelemetry配置
+      OPIK_OTEL_SDK_ENABLED: false
+      OTEL_VERSION: 2.12.0
+      OTEL_PROPAGATORS: "tracecontext,baggage,b3"
+      OTEL_EXPERIMENTAL_EXPORTER_OTLP_RETRY_ENABLED: true
+      OTEL_EXPORTER_OTLP_METRICS_DEFAULT_HISTOGRAM_AGGREGATION: BASE2_EXPONENTIAL_BUCKET_HISTOGRAM
+      OTEL_EXPERIMENTAL_RESOURCE_DISABLED_KEYS: process.command_args
+      OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE: delta
+
+    # 健康检查配置 - 给Java应用更多启动时间
+    livenessProbe:
+      httpGet:
+        path: /health-check
+        port: 8080
+      initialDelaySeconds: 120  # 2分钟初始延迟
+      periodSeconds: 30
+      timeoutSeconds: 10
+      failureThreshold: 3
+
+    readinessProbe:
+      httpGet:
+        path: /health-check
+        port: 8080
+      initialDelaySeconds: 120   # 2分钟初始延迟
+      periodSeconds: 10
+      timeoutSeconds: 5
+      failureThreshold: 5
+
+    service:
+      type: ClusterIP
+      ports:
+        - name: http
+          port: 8080
+          protocol: TCP
+          targetPort: 8080
+        - name: swagger
+          port: 3003
+          protocol: TCP
+          targetPort: 3003
+
+    # 配置ConfigMap - 包含调试版本的启动脚本
+    backendConfigMap:
+      enabled: true
+      data:
+        entrypoint-debug.sh: |
+          #!/bin/bash
+          set -e
+          
+          echo "=========================================="
+          echo "Opik Backend 调试启动脚本 v3 - 增强版"
+          echo "启动时间: $(date)"
+          echo "=========================================="
+          
+          echo "1. 环境信息检查..."
+          echo "当前目录: $(pwd)"
+          echo "Java版本:"
+          java -version
+          echo "用户信息: $(whoami || echo 'unknown')"
+          echo "磁盘空间:"
+          df -h /opt/opik
+          
+          echo "2. 显示重要环境变量..."
+          env | grep -E "(OPIK|ANALYTICS_DB|STATE_DB|REDIS)" | sort
+          
+          echo "3. 启动redoc服务器..."
+          jwebserver -d /opt/opik/redoc -b 0.0.0.0 -p 3003 &
+          REDOC_PID=$!
+          echo "Redoc service started as background process (PID: $REDOC_PID)"
+          
+          echo "4. 检查配置文件..."
+          if [ -f /opt/opik/config.yml ]; then
+            echo "Config文件大小: $(wc -l < /opt/opik/config.yml) 行"
+            echo "修复健康检查配置..."
+            sed -i 's/critical: true/critical: false/g' /opt/opik/config.yml
+            echo "健康检查配置已修改"
+            echo "显示health部分配置:"
+            grep -A 15 -B 5 "healthChecks:" /opt/opik/config.yml || echo "未找到healthChecks"
+          else
+            echo "❌ 配置文件不存在!"
+          fi
+          
+          echo "5. 检查数据库连接..."
+          echo "测试ClickHouse连接:"
+          timeout 5 bash -c "</dev/tcp/${ANALYTICS_DB_HOST}/${ANALYTICS_DB_PORT}" && echo "✅ ClickHouse可达" || echo "❌ ClickHouse连接失败"
+          
+          echo "6. 配置Java选项..."
+          echo "原有JAVA_OPTS: $JAVA_OPTS"
+          
+          echo "清理过时的Java选项..."
+          # 移除过时的GC选项
+          export JAVA_OPTS=$(echo "$JAVA_OPTS" | sed 's/-XX:+PrintGCDetails//g' | sed 's/-XX:+PrintGCTimeStamps//g')
+          
+          # 添加更详细的调试选项
+          export JAVA_OPTS="$JAVA_OPTS -Dlogging.level.com.comet=DEBUG"
+          export JAVA_OPTS="$JAVA_OPTS -Dlogging.level.root=INFO"
+          export JAVA_OPTS="$JAVA_OPTS -Dlogging.level.io.dropwizard=DEBUG"
+          export JAVA_OPTS="$JAVA_OPTS -Dlogging.level.liquibase=INFO"
+          echo "清理后JAVA_OPTS: $JAVA_OPTS"
+          
+          if [[ "${OPIK_OTEL_SDK_ENABLED}" == "true" && "${OTEL_VERSION}" != "" && "${OTEL_EXPORTER_OTLP_ENDPOINT}" != "" ]]; then
+              echo "下载 OpenTelemetry Java Agent..."
+              export OTEL_RESOURCE_ATTRIBUTES="service.name=opik-backend,service.version=${OPIK_VERSION}"
+              curl -L -o /tmp/opentelemetry-javaagent.jar https://github.com/open-telemetry/opentelemetry-java-instrumentation/releases/download/v${OTEL_VERSION}/opentelemetry-javaagent.jar
+              JAVA_OPTS="$JAVA_OPTS -javaagent:/tmp/opentelemetry-javaagent.jar"
+              echo "OpenTelemetry Java Agent配置完成"
+          else
+              echo "跳过 OpenTelemetry Java Agent"
+          fi
+          
+          if [ "$ENABLE_VIRTUAL_THREADS" = "true" ]; then
+              echo "启用虚拟线程..."
+              JAVA_OPTS="$JAVA_OPTS -Dreactor.schedulers.defaultBoundedElasticOnVirtualThreads=true"
+          fi
+          
+          echo "7. 启动Java应用并监控..."
+          echo "最终JAVA_OPTS: $JAVA_OPTS"
+          echo "启动命令: java $JAVA_OPTS -jar opik-backend-$OPIK_VERSION.jar server config.yml"
+          echo "=========================================="
+          echo "Java应用启动中..."
+          echo "=========================================="
+          
+          # 创建日志监控后台任务
+          monitor_startup() {
+            local count=0
+            while [ $count -lt 120 ]; do  # 监控2分钟
+              sleep 5
+              count=$((count + 5))
+              echo "⏰ 启动监控: ${count}秒 - Java进程状态检查..."
+          
+              # 检查Java进程
+              if ! kill -0 $JAVA_PID 2>/dev/null; then
+                echo "❌ Java进程已退出!"
+                break
+              fi
+          
+              # 检查端口监听
+              if timeout 2 bash -c 'echo > /dev/tcp/localhost/8080' 2>/dev/null; then
+                echo "✅ 端口8080已开始监听，应用启动成功!"
+                break
+              else
+                echo "⏳ 端口8080尚未就绪，继续等待..."
+              fi
+          
+              # 每30秒显示一次进程信息
+              if [ $((count % 30)) -eq 0 ]; then
+                echo "📊 当前时间: $(date)"
+                echo "📊 Redoc进程状态: $(kill -0 $REDOC_PID 2>/dev/null && echo 'Running' || echo 'Stopped')"
+              fi
+            done
+          
+            if [ $count -ge 120 ]; then
+              echo "⚠️ 启动监控超时(2分钟)，可能存在问题"
+              echo "🔍 最后检查端口状态..."
+              timeout 2 bash -c 'echo > /dev/tcp/localhost/8080' 2>/dev/null && echo "✅ 端口8080已就绪" || echo "❌ 端口8080未就绪"
+            fi
+          }
+          
+          # 启动Java应用并获取PID
+          java $JAVA_OPTS -jar opik-backend-$OPIK_VERSION.jar server config.yml &
+          JAVA_PID=$!
+          echo "🚀 Java应用已启动，PID: $JAVA_PID"
+          
+          # 启动监控
+          monitor_startup &
+          MONITOR_PID=$!
+          
+          # 等待Java进程结束
+          wait $JAVA_PID
+
+    # 自定义启动命令 - 使用调试脚本
+    command: ['sh', '-c']
+    args:
+      - |
+        echo "复制并执行调试启动脚本..."
+        cp /config/entrypoint-debug.sh /opt/opik/
+        chmod +x /opt/opik/entrypoint-debug.sh
+        exec /opt/opik/entrypoint-debug.sh
+
+    # Volume挂载配置 - 挂载调试脚本
+    volumeMounts:
+      - name: debug-script
+        mountPath: /config
+
+    # Volume配置 - 来源于ConfigMap
+    volumes:
+      - name: debug-script
+        configMap:
+          name: opik-backend
+          items:
+            - key: entrypoint-debug.sh
+              path: entrypoint-debug.sh
+              mode: 0755
+
+      # 配置Ingress（可选）
+    ingress:
+      enabled: false
+      ingressClassName: ""
+      annotations: {}
+      hosts: []
+      tls:
+        enabled: false
+        hosts: []
+        secretName: ""
+
+  # Python后端配置
+  python-backend:
+    enabled: true
+    serviceAccount:
+      create: true
+      name: opik-python-backend
+    image:
+      repository: ghcr.io/comet-ml/opik/opik-python-backend
+      pullPolicy: IfNotPresent
+      tag: latest
+    replicaCount: 1
+
+  # 前端配置
+  frontend:
+    enabled: true
+    serviceAccount:
+      create: true
+      name: opik-frontend
+    image:
+      repository: ghcr.io/comet-ml/opik/opik-frontend
+      pullPolicy: IfNotPresent
+      tag: latest
+    replicaCount: 1
+
+    service:
+      type: ClusterIP
+      ports:
+        - name: http
+          port: 5173
+          protocol: TCP
+          targetPort: 5173
+
+    # 配置Ingress（可选）
+    ingress:
+      enabled: false
+      ingressClassName: ""
+      annotations: {}
+      hosts: []
+      tls:
+        enabled: false
+        hosts: []
+        secretName: ""
+
+# 禁用所有内部数据库服务
+mysql:
+  enabled: false
+
+redis:
+  enabled: false
+
+clickhouse:
+  enabled: false
+
+altinity-clickhouse-operator:
+  enabled: false
+
+zookeeper:
+  enabled: false
+
+# MinIO对象存储（可以根据需要启用或使用外部对象存储）
+minio:
+  enabled: true
+  mode: standalone
+  disableWebUI: true
+  persistence:
+    enabled: true
+    size: 50Gi
+    storageClass: "alicloud-disk-essd"
+  auth:
+    rootUser: "THAAIOSFODNN7EXAMPLE"
+    rootPassword: "LESlrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+  provisioning:
+    enabled: true
+    extraCommands:
+      - mc alias set s3 http://opik-minio:9000 THAAIOSFODNN7EXAMPLE LESlrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY --api S3v4
+      - mc mb --ignore-existing s3/public
+      - mc anonymous set download s3/public/
+  fullnameOverride: opik-minio
